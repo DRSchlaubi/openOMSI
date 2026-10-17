@@ -16,13 +16,16 @@ impl VehicleInstance {
     /// Couple a vehicle behind the last part of the train; `reversed` cars run backwards
     /// (their `[coupling_back]` becomes the front coupling).
     pub fn attach_trailer_ex(&mut self, ty: Arc<VehicleType>, reversed: bool) {
+        if let Some(prev) = self.trailers.last_mut() {
+            prev.set_var("train_backcoupling", 1.0);
+        }
         let first_axle =
             self.physics.wheels.len() + self.trailers.iter().map(|t| t.axle_count).sum::<usize>();
         let (lead_ty, lead_reversed) = match self.trailers.last() {
             Some(t) => (t.ty.clone(), t.reversed),
             None => (self.ty.clone(), false),
         };
-        let t = TrailerPart::new_ex(
+        let t = TrailerPart::new_with_host(
             ty,
             &lead_ty,
             lead_reversed,
@@ -30,20 +33,206 @@ impl VehicleInstance {
             self.ty.program.as_ref(),
             first_axle,
             self.trailers.len(),
+            Some(&self.host),
         );
         self.trailers.push(t);
     }
 }
 
+/// Script state for a coupled vehicle that runs its own scripts (no `[scriptshare]`,
+/// e.g. coupled tram sections and rear cabs).
+pub struct PartScript {
+    pub state: State,
+    pub vm: Vm,
+    pub host: VehicleHost,
+    pub var_index: std::sync::Arc<HashMap<String, omsi_script::VarId>>,
+    pub html_textures: Vec<crate::htmltex::HtmlTexture>,
+    pub(super) v_velocity: Option<omsi_script::VarId>,
+    pub(super) v_velocity_ground: Option<omsi_script::VarId>,
+    pub(super) v_throttle: Option<omsi_script::VarId>,
+    pub(super) v_brake: Option<omsi_script::VarId>,
+    pub(super) v_clutch: Option<omsi_script::VarId>,
+    pub(super) v_m_wheel: Option<omsi_script::VarId>,
+    pub(super) v_alpha: Option<omsi_script::VarId>,
+    pub(super) v_beta: Option<omsi_script::VarId>,
+    pub(super) axle_ids: AxleVarIds,
+}
+
+impl PartScript {
+    fn new(
+        ty: &Arc<VehicleType>,
+        reversed: bool,
+        joint: usize,
+        main_host: Option<&VehicleHost>,
+    ) -> Self {
+        let program = ty.program.clone();
+        let mut state = State::new(&program);
+        let mut vm = Vm::new();
+        let mut host = VehicleHost::default();
+        if let Some(mh) = main_host {
+            host.clock = mh.clock.clone();
+            host.wear_lifespan = mh.wear_lifespan;
+            host.initial_number = mh.initial_number.clone();
+            host.initial_ident = mh.initial_ident.clone();
+            host.hof = mh.hof.clone();
+            host.paint_scheme = mh.paint_scheme;
+            host.schedule_active = mh.schedule_active;
+            host.precip_type = mh.precip_type;
+            host.precip_rate = mh.precip_rate;
+            host.street_cond = mh.street_cond;
+            host.temperature = mh.temperature;
+            host.abs_humidity = mh.abs_humidity;
+            host.sun_alt = mh.sun_alt;
+            host.ground_probe = mh.ground_probe.clone();
+        }
+        host.script_textures = ty
+            .model
+            .script_textures
+            .iter()
+            .map(|(w, h)| crate::scripttex::ScriptTexture::new(*w, *h))
+            .collect();
+        host.content_dir = ty.def.dir().to_path_buf();
+        let html_textures: Vec<crate::htmltex::HtmlTexture> = ty
+            .model
+            .html_textures
+            .iter()
+            .map(|d| {
+                let dirs = [ty.model_dir.as_path(), ty.def.dir()];
+                let html = crate::htmltex::load_page(&dirs, &d.path);
+                crate::htmltex::HtmlTexture::new(d.script_index, d.width, d.height, &html)
+                    .with_asset_dirs(crate::htmltex::asset_dirs(&dirs, &d.path))
+            })
+            .collect();
+        host.number_var = program.str_var("number");
+        if let (Some(i), Some(number)) = (program.str_var("number"), host.initial_number.as_ref()) {
+            state.str_vars[i as usize] = number.clone();
+        }
+        if let (Some(i), Some(ident)) = (program.str_var("ident"), host.initial_ident.as_ref()) {
+            state.str_vars[i as usize] = ident.clone();
+        }
+        let mut var_index = HashMap::new();
+        for (i, n) in program.var_names.iter().enumerate() {
+            var_index.insert(n.to_ascii_lowercase(), i as omsi_script::VarId);
+        }
+        if let Some(i) = var_index.get("envir_brightness") {
+            state.vars[*i as usize] = 1.0;
+        }
+        if let Some(i) = var_index.get("giventicket") {
+            state.vars[*i as usize] = -1.0;
+        }
+        if let Some(i) = var_index.get("wearlifespan") {
+            state.vars[*i as usize] = host.wear_lifespan.max(0.01);
+        }
+        for (name, value) in [
+            ("Dirt_Norm", 0.0),
+            ("DirtRate", 0.0),
+            ("PrecipRate", 0.0),
+            ("StreetCond", 0.0),
+            ("train_frontcoupling", 1.0),
+            ("train_backcoupling", 0.0),
+            ("train_me_reverse", if reversed { 1.0 } else { 0.0 }),
+        ] {
+            let key = name.to_ascii_lowercase();
+            let id = match var_index.get(&key).copied() {
+                Some(id) => id,
+                None => {
+                    let id = state.vars.len() as omsi_script::VarId;
+                    state.vars.push(value);
+                    var_index.insert(key, id);
+                    id
+                }
+            };
+            state.vars[id as usize] = value;
+        }
+        let mut model_only: Vec<(String, Option<f32>)> = Vec::new();
+        for (name, value) in ty.model.meshes.iter().filter_map(|m| m.visible.as_ref()) {
+            let key = name.to_ascii_lowercase();
+            if var_index.contains_key(&key) {
+                continue;
+            }
+            match model_only.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, v)) => {
+                    if *v != Some(*value) {
+                        *v = None;
+                    }
+                }
+                None => model_only.push((key, Some(*value))),
+            }
+        }
+        for c in ty.model.meshes.iter().flat_map(|m| m.visible_groups()).flatten() {
+            let key = c.variable.to_ascii_lowercase();
+            if !var_index.contains_key(&key) && !model_only.iter().any(|(k, _)| *k == key) {
+                model_only.push((key, None));
+            }
+        }
+        for (key, value) in model_only {
+            let id = state.vars.len() as omsi_script::VarId;
+            state.vars.push(value.unwrap_or(0.0));
+            var_index.insert(key, id);
+        }
+        for n in program
+            .var_names
+            .iter()
+            .filter(|n| n.to_ascii_lowercase().starts_with("axle_springfactor_"))
+        {
+            if let Some(i) = var_index.get(&n.to_ascii_lowercase()) {
+                state.vars[*i as usize] = 1.0;
+            }
+        }
+        if let (Some(i), Some(h)) = (program.str_var("yard"), host.hof.as_ref()) {
+            state.str_vars[i as usize] = h.name.clone();
+        }
+        if let Some(scheme) = host.paint_scheme {
+            let scheme = scheme.filter(|i| *i < ty.paint_schemes.len());
+            let mut put = |name: &str, v: f32| {
+                if let Some(id) = var_index.get(&name.to_ascii_lowercase()) {
+                    state.vars[*id as usize] = v;
+                }
+            };
+            put("Colorscheme", scheme.map(|i| i as f32).unwrap_or(-1.0));
+            if let Some(i) = scheme {
+                for (var, v) in &ty.paint_schemes[i].set_vars {
+                    put(var, *v);
+                }
+            }
+        }
+        if let Some(i) = var_index.get("schedule_active") {
+            state.vars[*i as usize] = host.schedule_active;
+        }
+        vm.run_init(&program, &mut state, &mut host);
+        let v = |name: &str| program.var(name);
+        let mut axle_ids = AxleVarIds::default();
+        axle_ids.refresh_for(&program, &var_index, 0, ty.def.axles.len().max(1));
+        PartScript {
+            state,
+            vm,
+            host,
+            var_index: std::sync::Arc::new(var_index),
+            html_textures,
+            v_velocity: v("Velocity"),
+            v_velocity_ground: v("Velocity_Ground"),
+            v_throttle: v("Throttle").or_else(|| v("throttle_pedal")),
+            v_brake: v("Brake").or_else(|| v("brake_pedal")),
+            v_clutch: v("Clutch").or_else(|| v("clutch_pedal")),
+            v_m_wheel: v("M_Wheel"),
+            v_alpha: v(&format!("articulation_{joint}_alpha")).or_else(|| v("articulation_0_alpha")),
+            v_beta: v(&format!("articulation_{joint}_beta")).or_else(|| v("articulation_0_beta")),
+            axle_ids,
+        }
+    }
+}
+
 /// A vehicle coupled behind another (articulated bus rear section, trailer, train car).
-/// It has no script state of its own: meshes animate from the leading vehicle's
-/// variables, and it is towed at the coupling point with trailer kinematics.
+/// With `[scriptshare]` (or no scripts) its meshes animate from the leading vehicle's
+/// variables; otherwise it owns a [`PartScript`] and communicates through control cables.
 /// Sign of `articulation_<n>_alpha` relative to (heading in front − own heading), clockwise
 /// degrees: settled with the GN92's joint dummies (see the vehicle tests).
 pub(super) const ARTICULATION_SIGN: f64 = 1.0;
 
 pub struct TrailerPart {
     pub ty: Arc<VehicleType>,
+    /// Own script state when the coupled vehicle does not use `[scriptshare]`.
+    pub script: Option<PartScript>,
     /// The part's own `[smoke]` particle systems (the pusher's rear engine).
     pub particles: ParticleSet,
     /// Its lights' brightness as they come on and go out (see `VehicleInstance::light_fade`).
@@ -130,7 +319,7 @@ pub(super) struct AxleVarIds {
     pub(super) suspension: Vec<[Option<omsi_script::VarId>; 2]>,
     /// `Axle_Steering_<n>_L/R`.
     pub(super) steering: Vec<[Option<omsi_script::VarId>; 2]>,
-    /// `Axle_Springfactor_<n>_L`.
+    /// `Axle_Springfactor_*_L`.
     pub(super) spring_factor: Vec<Option<omsi_script::VarId>>,
 }
 
@@ -138,18 +327,29 @@ impl AxleVarIds {
     /// Made (again) for `main` unless they are for its program and variables already;
     /// `axles` of the part from train axle `first`.
     fn refresh(&mut self, main: &VehicleInstance, first: usize, axles: usize) {
-        let key = (Arc::as_ptr(&main.ty.program) as usize, main.var_index.len());
+        self.refresh_for(&main.ty.program, &main.var_index, first, axles);
+    }
+
+    fn refresh_for(
+        &mut self,
+        p: &Arc<Program>,
+        var_index: &HashMap<String, omsi_script::VarId>,
+        first: usize,
+        axles: usize,
+    ) {
+        let key = (Arc::as_ptr(p) as usize, var_index.len());
         if self.made_for == Some(key) {
             return;
         }
-        let p = &main.ty.program;
         let sides = |f: &dyn Fn(&str) -> Option<omsi_script::VarId>| ["L", "R"].map(|side| f(side));
         let n = first..first + axles;
         self.rotation = n.clone().map(|k| sides(&|side| p.var(&format!("Wheel_Rotation_{k}_{side}")))).collect();
         self.rotation_speed = n.clone().map(|k| sides(&|side| p.var(&format!("Wheel_RotationSpeed_{k}_{side}")))).collect();
         self.suspension = n.clone().map(|k| sides(&|side| p.var(&format!("Axle_Suspension_{k}_{side}")))).collect();
         self.steering = n.clone().map(|k| sides(&|side| p.var(&format!("Axle_Steering_{k}_{side}")))).collect();
-        self.spring_factor = n.map(|k| main.var_slot(&format!("Axle_Springfactor_{k}_L")).map(|i| i as omsi_script::VarId)).collect();
+        self.spring_factor = n
+            .map(|k| var_index.get(&format!("axle_springfactor_{k}_l")).copied())
+            .collect();
         self.made_for = Some(key);
     }
 }
@@ -218,10 +418,26 @@ impl TrailerPart {
         first_axle: usize,
         joint: usize,
     ) -> TrailerPart {
+        Self::new_with_host(ty, main, main_reversed, reversed, program, first_axle, joint, None)
+    }
+
+    pub(super) fn new_with_host(
+        ty: Arc<VehicleType>,
+        main: &VehicleType,
+        main_reversed: bool,
+        reversed: bool,
+        program: &Program,
+        first_axle: usize,
+        joint: usize,
+        main_host: Option<&VehicleHost>,
+    ) -> TrailerPart {
+        let own_scripts = !ty.def.script_share && !ty.def.scripts.scripts.is_empty();
+        let anim_prog = if own_scripts { ty.program.as_ref() } else { program };
+        let script = own_scripts.then(|| PartScript::new(&ty, reversed, joint, main_host));
         let mut animators: Vec<MeshAnimator> = ty
             .meshes
             .iter()
-            .map(|m| MeshAnimator::new(&ty.model.meshes[m.def_index], m.pivot, |n| program.var(n)))
+            .map(|m| MeshAnimator::new(&ty.model.meshes[m.def_index], m.pivot, |n| anim_prog.var(n)))
             .collect();
         crate::anim::link_parents(
             &mut animators,
@@ -293,11 +509,12 @@ impl TrailerPart {
         if let Some(l) = loads.first_mut().filter(|_| joint_load > 0.0) {
             *l -= joint_load / 2.0;
         }
+        let hub_first = if script.is_some() { 0 } else { first_axle };
         let rest = ty
             .def
             .axles
             .iter()
-            .zip(ty.hub_heights(first_axle))
+            .zip(ty.hub_heights(hub_first))
             .enumerate()
             .map(|(a, (axle, z))| {
                 let r = (axle.wheel_diameter / 2.0).max(0.15);
@@ -316,6 +533,7 @@ impl TrailerPart {
             })
             .collect();
         TrailerPart {
+            script,
             particles: ParticleSet::new(ty.model.particle_systems(), first_axle as u64 * 7919 + 17),
             light_fade: Vec::new(),
             rest,
@@ -355,6 +573,36 @@ impl TrailerPart {
         }
     }
 
+    /// Read a variable from this part's own script state if it has one.
+    pub fn var(&self, name: &str) -> Option<f32> {
+        let s = self.script.as_ref()?;
+        omsi_script::compile::with_lower(name, |k| s.var_index.get(k).copied())
+            .and_then(|i| s.state.vars.get(i as usize).copied())
+    }
+
+    /// Write a variable in this part's own script state if it has one.
+    pub fn set_var(&mut self, name: &str, v: f32) -> bool {
+        let Some(s) = self.script.as_mut() else {
+            return false;
+        };
+        let Some(i) = omsi_script::compile::with_lower(name, |k| s.var_index.get(k).copied()) else {
+            return false;
+        };
+        if let Some(slot) = s.state.vars.get_mut(i as usize) {
+            *slot = v;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Read a string variable from this part's own script state if it has one.
+    pub fn str_var(&self, name: &str) -> Option<&str> {
+        let s = self.script.as_ref()?;
+        let i = self.ty.program.str_var(name)?;
+        s.state.str_vars.get(i as usize).map(|v| v.as_str())
+    }
+
     /// The `[smoothskin]` meshes of this part.
     pub fn skinned_meshes(&self) -> Vec<usize> {
         (0..self.ty.meshes.len())
@@ -370,6 +618,7 @@ impl TrailerPart {
     /// Skinned mesh `i` as its bones hold it now; `n_vars`: the leading vehicle's variable
     /// count (this part animates from its variables).
     pub fn skinned(&mut self, i: usize, n_vars: usize) -> Option<(Vec<Vec3>, Vec<Vec3>)> {
+        let n_vars = self.script.as_ref().map_or(n_vars, |s| s.state.vars.len());
         if self.skin_rest.len() != self.animators.len() {
             self.skin_rest = rest_transforms(&self.animators, n_vars);
         }
@@ -391,12 +640,29 @@ impl TrailerPart {
             .collect();
     }
 
-    /// Re-render the text textures whose variable (of the leading vehicle) changed;
-    /// returns the indices with a pending image.
+    /// Re-render the text textures whose variable (of the part's own scripts or the leading
+    /// vehicle) changed; returns the indices with a pending image.
     pub fn update_text_textures(&mut self, main: &VehicleInstance) -> Vec<usize> {
+        if let Some(s) = &mut self.script {
+            if let Some(id) = self.ty.program.var("Refresh_Strings") {
+                s.state.vars[id as usize] = 0.0;
+            }
+        }
         let mut changed = Vec::new();
         for (i, t) in self.text_textures.iter_mut().enumerate() {
-            if t.update(main.text_texture_str(&t.def.variable)) {
+            let text = self
+                .script
+                .as_ref()
+                .and_then(|s| {
+                    self.ty
+                        .program
+                        .text_texture_var(&t.def.variable)
+                        .and_then(|v| s.state.str_vars.get(v as usize))
+                        .map(|v| v.as_str())
+                        .filter(|v| !v.is_empty())
+                })
+                .unwrap_or_else(|| main.text_texture_str(&t.def.variable));
+            if t.update(text) {
                 changed.push(i);
             }
         }
@@ -510,7 +776,7 @@ impl TrailerPart {
     /// as far down as the scripts' `Axle_Springfactor` lets the load press it. Writes each
     /// axle's `Axle_Suspension_*` and returns how far the part's origin stands above the
     /// ground under its axles (m).
-    fn rest_springs(&self, main: &mut VehicleInstance) -> f64 {
+    fn rest_springs(&mut self, main: &mut VehicleInstance) -> f64 {
         let ai = main.ev(Ev::Ai).map(|v| v > 0.5).unwrap_or(false);
         let shows = !self.ty.suspension_axles.is_empty();
         let mut sag = Vec::with_capacity(self.rest.len());
@@ -522,9 +788,12 @@ impl TrailerPart {
                 } else {
                     0.0
                 }
-            } else if self.ty.suspension_axles.contains(&axle) {
-                let factor = self.axle_ids.spring_factor[a]
-                    .map(|i| main.state.vars[i as usize])
+            } else if self.ty.suspension_axles.contains(&axle) || self.ty.suspension_axles.contains(&a) {
+                let factor = self
+                    .script
+                    .as_ref()
+                    .and_then(|s| s.axle_ids.spring_factor.get(a).copied().flatten().map(|i| s.state.vars[i as usize]))
+                    .or_else(|| self.axle_ids.spring_factor[a].map(|i| main.state.vars[i as usize]))
                     .unwrap_or(1.0)
                     .max(0.05);
                 (load / (k * factor)).min(crate::rigid::BUMP)
@@ -533,6 +802,13 @@ impl TrailerPart {
             };
             for id in self.axle_ids.suspension[a].into_iter().flatten() {
                 main.state.vars[id as usize] = -compression;
+            }
+            if let Some(s) = &mut self.script {
+                if let Some(sides) = s.axle_ids.suspension.get(a) {
+                    for id in sides.iter().copied().flatten() {
+                        s.state.vars[id as usize] = -compression;
+                    }
+                }
             }
             sag.push(offset - compression);
         }
@@ -569,7 +845,11 @@ impl TrailerPart {
         (front, y_front): (DVec3, f32),
         (back, y_back): (DVec3, f32),
     ) {
-        self.axle_ids.refresh(main, self.first_axle, self.axle_count.max(self.rest.len()));
+        let axles = self.axle_count.max(self.rest.len());
+        self.axle_ids.refresh(main, self.first_axle, axles);
+        if let Some(s) = &mut self.script {
+            s.axle_ids.refresh_for(&self.ty.program, &s.var_index, 0, axles);
+        }
         let d = front - back;
         let run = d.truncate().length();
         if run > 1e-3 {
@@ -593,7 +873,11 @@ impl TrailerPart {
     }
 
     pub(super) fn update(&mut self, main: &mut VehicleInstance, dt: f32, lead: Option<(DVec3, Mat4, f64)>) {
-        self.axle_ids.refresh(main, self.first_axle, self.axle_count.max(self.rest.len()));
+        let axles = self.axle_count.max(self.rest.len());
+        self.axle_ids.refresh(main, self.first_axle, axles);
+        if let Some(s) = &mut self.script {
+            s.axle_ids.refresh_for(&self.ty.program, &s.var_index, 0, axles);
+        }
         if self.remote {
             // Another game's rear section stands where that game says, leaning onto the
             // coupling (`set_remote_pose`). Walked on behind the coupling here as well, it
@@ -793,11 +1077,21 @@ impl TrailerPart {
         let lead_pitch = if lead_pitch.abs() > 90.0 { lead_pitch - 180.0 * lead_pitch.signum() } else { lead_pitch };
         let alpha = ((lead_heading - self.heading + 540.0) % 360.0) - 180.0;
         let beta = lead_pitch - self.pitch as f64;
+        let alpha_val = (alpha * ARTICULATION_SIGN) as f32;
+        let beta_val = beta as f32;
         if let Some(id) = self.v_alpha {
-            main.state.vars[id as usize] = (alpha * ARTICULATION_SIGN) as f32;
+            main.state.vars[id as usize] = alpha_val;
         }
         if let Some(id) = self.v_beta {
-            main.state.vars[id as usize] = beta as f32;
+            main.state.vars[id as usize] = beta_val;
+        }
+        if let Some(s) = &mut self.script {
+            if let Some(id) = s.v_alpha {
+                s.state.vars[id as usize] = alpha_val;
+            }
+            if let Some(id) = s.v_beta {
+                s.state.vars[id as usize] = beta_val;
+            }
         }
         let rpm =
             main.physics.velocity_kmh() / 3.6 / (2.0 * std::f32::consts::PI * self.wheel_radius)
@@ -815,15 +1109,29 @@ impl TrailerPart {
                 if let Some(id) = self.axle_ids.rotation_speed[a][side] {
                     main.state.vars[id as usize] = rpm;
                 }
+                if let Some(ps) = &mut self.script {
+                    if let (Some(Some(id)), Some(s)) = (ps.axle_ids.steering.get(a).map(|s| s[side]), steer) {
+                        ps.state.vars[id as usize] = s;
+                    }
+                    if let Some(Some(id)) = ps.axle_ids.rotation.get(a).map(|r| r[side]) {
+                        ps.state.vars[id as usize] = rot;
+                    }
+                    if let Some(Some(id)) = ps.axle_ids.rotation_speed.get(a).map(|r| r[side]) {
+                        ps.state.vars[id as usize] = rpm;
+                    }
+                }
             }
         }
+        let (vars, var_index) = match &self.script {
+            Some(s) => (&s.state.vars, &s.var_index),
+            None => (&main.state.vars, &main.var_index),
+        };
         for (i, a) in self.animators.iter_mut().enumerate() {
-            self.mesh_transforms[i] = a.update(dt, &main.state.vars);
+            self.mesh_transforms[i] = a.update(dt, vars);
         }
         crate::anim::apply_parents(&self.animators, &mut self.mesh_transforms);
-        self.props_plan.refresh(&self.ty, &main.var_index);
-        self.props_plan
-            .apply(&main.state.vars, &mut self.mesh_props);
+        self.props_plan.refresh(&self.ty, var_index);
+        self.props_plan.apply(vars, &mut self.mesh_props);
     }
 }
 
@@ -845,7 +1153,7 @@ impl TrailerPart {
 
     /// `Axle_Suspension_*` of the part's sprung axles from the ground under each wheel, the
     /// body standing at `self.position` turned by `rot` (see `update`).
-    pub(super) fn spring_wheels(&self, main: &mut VehicleInstance, rot: Mat4) {
+    pub(super) fn spring_wheels(&mut self, main: &mut VehicleInstance, rot: Mat4) {
         let probe = |x: f64, y: f64, top: f64| -> Option<f64> {
             match (&main.contact, &main.ground) {
                 (Some(g), _) => g.probe(x, y, top).below,
@@ -856,7 +1164,7 @@ impl TrailerPart {
         let mut travel: Vec<(usize, [Option<f32>; 2])> = Vec::new();
         for (a, (offset, _, _)) in self.rest.iter().enumerate() {
             let axle = self.first_axle + a;
-            if !self.ty.suspension_axles.contains(&axle) {
+            if !self.ty.suspension_axles.contains(&axle) && !self.ty.suspension_axles.contains(&a) {
                 continue;
             }
             let Some(def) = self.ty.def.axles.get(a) else { continue };
@@ -878,6 +1186,15 @@ impl TrailerPart {
             for (id, c) in self.axle_ids.suspension[a].into_iter().zip(sides) {
                 if let (Some(c), Some(id)) = (c, id) {
                     main.state.vars[id as usize] = -c;
+                }
+            }
+            if let Some(s) = &mut self.script {
+                if let Some(susp) = s.axle_ids.suspension.get(a) {
+                    for (id, c) in susp.iter().copied().zip(sides) {
+                        if let (Some(c), Some(id)) = (c, id) {
+                            s.state.vars[id as usize] = -c;
+                        }
+                    }
                 }
             }
         }

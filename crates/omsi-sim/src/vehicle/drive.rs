@@ -67,7 +67,15 @@ impl VehicleInstance {
         self.put(self.v_throttle, c.throttle);
         self.put(self.v_brake, c.brake);
         self.put(self.v_clutch, c.clutch);
-        let m_wheel = self.get(self.v_m_wheel);
+        let mut m_wheel = self.get(self.v_m_wheel);
+        for t in &mut self.trailers {
+            if let Some(s) = &mut t.script {
+                if let Some(id) = s.v_m_wheel {
+                    let m = s.state.vars[id as usize];
+                    m_wheel += if t.reversed { -m } else { m };
+                }
+            }
+        }
         // each wheel: its own brake force, and its share of the vehicle's (the rolling
         // resistance's share is the physics' own)
         let n = (self.v_wheels.len() * 2).max(1) as f32;

@@ -249,7 +249,7 @@ impl Player {
             .clone()
             .unwrap();
         log::info!("trailer mouse event {ev} (part {ti})");
-        self.vehicle.trigger(&ev);
+        self.vehicle.trigger_trailer(ti, &ev);
         self.vehicle.update_scripts_only(0.0);
         self.clear_momentary_mouse_flag(&ev);
         self.pressed_trailer_mesh = Some((ti, i));
@@ -291,7 +291,7 @@ impl Player {
             else {
                 return;
             };
-            (ev, false)
+            (ev, None)
         } else if let Some((ti, i)) = self.pressed_trailer_mesh {
             let Some(ev) = self.vehicle.trailers[ti].ty.model.meshes
                 [self.vehicle.trailers[ti].ty.meshes[i].def_index]
@@ -300,16 +300,22 @@ impl Player {
             else {
                 return;
             };
-            (ev, true)
+            (ev, Some(ti))
         } else {
             return;
         };
         let name = format!("{ev}_drag");
         self.press_info.1 += dx.abs() + dy.abs();
         self.vehicle.host.mouse = (dx, dy);
-        self.vehicle.trigger(&name);
+        match trailer {
+            Some(ti) => {
+                self.vehicle.trigger_trailer(ti, &name);
+            }
+            None => {
+                self.vehicle.trigger(&name);
+            }
+        }
         self.vehicle.host.mouse = (0.0, 0.0);
-        let _ = trailer;
     }
 
     /// One notch of the mouse wheel over a switch: `<event>_drag` with the notch as the
@@ -368,7 +374,7 @@ impl Player {
                 .mouse_event
                 .clone()
             {
-                self.vehicle.trigger(&format!("{ev}_off"));
+                self.vehicle.trigger_trailer(ti, &format!("{ev}_off"));
             }
         }
     }

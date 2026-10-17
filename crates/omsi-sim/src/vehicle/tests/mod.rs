@@ -925,3 +925,198 @@ fn a_scheme_folder_supplies_only_what_its_cti_names() {
     assert!(body.is_absolute(), "{}", map["body.bmp"]);
     assert_eq!(map["sedista.bmp"], "sedista-diffuse.bmp", "a picture the folder has not got: the bare name, found with the model's textures");
 }
+
+#[test]
+fn coupled_tram_parts_run_own_scripts_and_control_cables() {
+    let dir = std::env::temp_dir().join(format!("omsi_tram_cables_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let var_a = dir.join("var_a.txt");
+    let osc_a = dir.join("a.osc");
+    let var_c = dir.join("var_c.txt");
+    let osc_c = dir.join("c.osc");
+    std::fs::write(
+        &var_a,
+        "Steuerleitung_H\nSLA_Panto_oben\nSLR_Panto_oben\nSLR_Elec_Netz\nM_Wheel\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &osc_a,
+        "{init}\n1 (S.L.Steuerleitung_H)\n{end}\n{trigger:raise_panto}\n1 (S.L.SLA_Panto_oben)\n{end}\n{frame}\n(L.L.SLR_Elec_Netz) 1 = {if} 500 (S.L.M_Wheel) {endif}\n{end}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &var_c,
+        "Steuerleitung_V\nSLR_Panto_oben\nSLW_Elec_Netz\nPanto_anim_oben\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &osc_c,
+        "{init}\n1 (S.L.Steuerleitung_V)\n1.39 (S.L.Panto_anim_oben)\n{end}\n{frame}\n(L.L.SLR_Panto_oben) 1 = {if} 0.089 (S.L.Panto_anim_oben) 1 (S.L.SLW_Elec_Netz) {endif}\n{end}\n",
+    )
+    .unwrap();
+
+    let prog_a = Arc::new(omsi_script::compile(&omsi_script::CompileInput {
+        builtin_vars: vec!["M_Wheel".into()],
+        varlists: vec![var_a.clone()],
+        scripts: vec![osc_a.clone()],
+        ..Default::default()
+    }));
+    let prog_c = Arc::new(omsi_script::compile(&omsi_script::CompileInput {
+        varlists: vec![var_c.clone()],
+        scripts: vec![osc_c.clone()],
+        ..Default::default()
+    }));
+    std::fs::remove_dir_all(&dir).ok();
+
+    let cable = |plug: &str, idx: &str, r: &str, w: &str, c: &str| omsi_vehicle::vehicle::ControlCable {
+        lines: vec![plug.into(), idx.into(), r.into(), w.into(), c.into()],
+    };
+    let mut ty_a = coupling_test_type(Some(3.0));
+    {
+        let a = Arc::get_mut(&mut ty_a).unwrap();
+        a.program = prog_a;
+        a.def.scripts.scripts = vec!["a.osc".into()];
+        a.def.control_cable_back = vec![
+            cable("C", "0", "SLR_Panto_oben", "SLA_Panto_oben", "Steuerleitung_H"),
+            cable("C", "5", "SLR_Elec_Netz", "dummy", "Steuerleitung_H"),
+        ];
+    }
+    let mut ty_c = coupling_test_type(Some(3.0));
+    {
+        let c = Arc::get_mut(&mut ty_c).unwrap();
+        c.program = prog_c;
+        c.def.script_share = false;
+        c.def.scripts.scripts = vec!["c.osc".into()];
+        c.def.control_cable_front = vec![
+            cable("C", "0", "SLR_Panto_oben", "dummy", "Steuerleitung_V"),
+            cable("C", "5", "dummy", "SLW_Elec_Netz", "Steuerleitung_V"),
+        ];
+        c.model.meshes.push(omsi_model::MeshDef {
+            file: "panto.o3d".into(),
+            animations: vec![omsi_model::Animation {
+                kind: Some(omsi_model::AnimKind::Rot),
+                variable: "Panto_anim_oben".into(),
+                factor: 45.0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        c.meshes.push(VehicleMesh {
+            def_index: 0,
+            file: "panto.o3d".into(),
+            data: omsi_geometry::MeshData::default(),
+            materials: Vec::new(),
+            overrides: Vec::new(),
+            viewpoint: 0,
+            pivot: Mat4::IDENTITY,
+            keep_winding: false,
+            skin: Vec::new(),
+        });
+    }
+
+    let mut v = VehicleInstance::new(ty_a, VehicleHost::new(Default::default()));
+    v.attach_trailer_ex(ty_c, false);
+    assert!(
+        v.trailers[0].animators[0].anims[0].2.var.is_some(),
+        "Panto_anim_oben must resolve against the coupled part's own program"
+    );
+    assert_eq!(v.trailers[0].var("Panto_anim_oben"), Some(1.39));
+
+    v.trigger("raise_panto");
+    v.update(0.05);
+    assert_eq!(v.trailers[0].var("SLR_Panto_oben"), Some(1.0));
+    assert_eq!(v.trailers[0].var("Panto_anim_oben"), Some(0.089));
+    assert_eq!(v.var("SLR_Elec_Netz"), Some(1.0));
+    v.update(0.05);
+    assert_eq!(v.var("M_Wheel"), Some(500.0));
+}
+
+#[test]
+#[ignore]
+fn nf6d_tram_raises_pantograph_and_drives_without_missing_anim_vars() {
+    let root = original_root();
+    let bus_path = root.join("Vehicles/Tram_NF6D/NF6D_A.bus");
+    if !bus_path.exists() {
+        return;
+    }
+    let ty = Arc::new(VehicleType::load(&root, &bus_path).unwrap());
+    let mut v = VehicleInstance::new(ty.clone(), VehicleHost::new(Default::default()));
+    let mut lead_def = ty.def.clone();
+    let mut lead_rev = false;
+    let mut seen = vec![lead_def.path.clone()];
+    for _ in 0..omsi_vehicle::vehicle::MAX_COUPLED_PARTS {
+        let Some((p, rev)) = omsi_vehicle::vehicle::next_coupled(&lead_def, lead_rev, true) else {
+            break;
+        };
+        if omsi_vehicle::vehicle::chain_has_part(&seen, &p) {
+            break;
+        }
+        seen.push(p.clone());
+        let t_ty = Arc::new(VehicleType::load(&root, &p).unwrap());
+        lead_def = t_ty.def.clone();
+        lead_rev = rev;
+        v.attach_trailer_ex(t_ty, rev);
+    }
+    assert_eq!(v.trailers.len(), 11);
+    for (ti, t) in v.trailers.iter().enumerate() {
+        for a in &t.animators {
+            for (d, _, st) in &a.anims {
+                let name = d.variable.trim();
+                if !name.is_empty() && name.parse::<f32>().is_err() {
+                    assert!(
+                        st.var.is_some(),
+                        "part {ti} ({}) missing animation variable {name}",
+                        t.ty.def.path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    for _ in 0..5 {
+        v.update(0.05);
+    }
+    assert_eq!(v.var("SLR_B_Kopf_Inaktiv"), Some(1.0));
+
+    // Turn on battery and press the pantograph-up button
+    assert!(v.trigger("cp_batterietrennschalter_toggle"));
+    for _ in 0..5 {
+        v.update(0.05);
+    }
+
+    assert!(v.trigger("kw_M_enginestart"));
+    for _ in 0..160 {
+        v.update(0.05);
+    }
+    v.trigger("kw_M_enginestart_off");
+
+    let panto = v.trailers[2].var("Panto_anim_oben").unwrap_or(1.39);
+    assert!(panto < 0.2, "pantograph should have raised, got {panto}");
+    assert_eq!(v.var("SLW_Elec_Netz"), Some(1.0));
+
+    // Select N -> D and apply throttle
+    assert!(v.trigger("kw_s_N"));
+    v.update(0.05);
+    assert!(v.trigger("automatic_D"));
+    v.update(0.05);
+    v.set_controls(Controls {
+        throttle: 0.5,
+        brake: 0.0,
+        clutch: 0.0,
+        steering: 0.0,
+    });
+    for _ in 0..160 {
+        v.update(0.05);
+    }
+    assert!(
+        v.var("M_Wheel").unwrap_or(0.0) > 0.0,
+        "expected positive M_Wheel traction torque, got {:?}",
+        v.var("M_Wheel")
+    );
+    assert!(
+        v.physics.velocity_kmh() > 0.1,
+        "expected tram to accelerate forward, got {} km/h",
+        v.physics.velocity_kmh()
+    );
+}
+

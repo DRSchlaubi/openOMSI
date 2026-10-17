@@ -57,8 +57,27 @@ pub fn sync_vehicle_materials(
     sync_materials(renderer, scene, vehicle, render);
 }
 
-/// A coupled part's switched materials and text textures, driven by the variables of the
-/// vehicle it is coupled to (its scripts are shared with it).
+struct PartLookVars<'a> {
+    main: &'a omsi_sim::VehicleInstance,
+    part: &'a omsi_sim::vehicle::TrailerPart,
+}
+
+impl LookVars for PartLookVars<'_> {
+    fn var(&self, name: &str) -> Option<f32> {
+        self.part.var(name).or_else(|| self.main.var(name))
+    }
+
+    fn str_var(&self, name: &str) -> &str {
+        self.part
+            .str_var(name)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| LookVars::str_var(self.main, name))
+    }
+}
+
+/// A coupled part's switched materials and text textures, driven by its own script state
+/// when it has one or the variables of the vehicle it is coupled to (`[scriptshare]`).
 pub fn sync_vehicle_part(
     renderer: &Renderer,
     scene: &mut Scene,
@@ -72,10 +91,11 @@ pub fn sync_vehicle_part(
         &part.ty,
         part.position,
         part.body_rotation(),
-        |li| interior_lamp_on(&part.ty, li, |n| main.var(n)),
+        |li| interior_lamp_on(&part.ty, li, |n| part.var(n).or_else(|| main.var(n))),
         render,
     );
-    sync_materials(renderer, scene, main, render);
+    let lv = PartLookVars { main, part };
+    sync_materials(renderer, scene, &lv, render);
     for i in part.update_text_textures(main) {
         if let (Some(Some(tex)), Some(img)) = (
             render.text_textures.get(i),
@@ -92,6 +112,27 @@ pub fn sync_vehicle_part(
                     has_alpha: true,
                 },
             );
+        }
+    }
+    if let Some(s) = &mut part.script {
+        let scripted = part.ty.model.script_textures.len();
+        for (i, st) in s.host.script_textures.iter_mut().enumerate() {
+            if i >= scripted {
+                continue;
+            }
+            if let (Some(&Some(tex)), Some(rgba)) = (render.script_textures.get(i), st.take_upload()) {
+                let img = Image {
+                    width: st.width,
+                    height: st.height,
+                    rgba,
+                    has_alpha: true,
+                };
+                if st.mipmaps {
+                    renderer.update_texture_mips(scene, tex, &img);
+                } else {
+                    renderer.update_texture(scene, tex, &img);
+                }
+            }
         }
     }
 }

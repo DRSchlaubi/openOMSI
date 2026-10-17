@@ -166,8 +166,12 @@ impl VehicleInstance {
         self.update_engine_vars(dt);
         crate::timetable_run::apply_pending_destination(self);
         self.apply_scheme_vars_each_frame();
+        self.update_control_cables();
         let p = self.ty.program.clone();
         self.vm.run_frame(&p, &mut self.state, &mut self.host);
+        self.update_control_cables();
+        self.update_part_scripts(dt, None);
+        self.update_control_cables();
         self.show_radio_text();
         self.clear_pax_requests();
         self.update_visuals(dt);
@@ -194,11 +198,228 @@ impl VehicleInstance {
     /// switch just pressed makes of the variables the scripts derive from it.
     pub fn update_scripts_only(&mut self, _dt: f32) {
         crate::timetable_run::apply_pending_destination(self);
+        self.update_control_cables();
         let p = self.ty.program.clone();
         let gap = self.host.clock.timegap;
         self.host.clock.timegap = 0.0;
         self.vm.run_frame(&p, &mut self.state, &mut self.host);
         self.host.clock.timegap = gap;
+        self.update_control_cables();
+        for t in &mut self.trailers {
+            if let Some(s) = &mut t.script {
+                let p = t.ty.program.clone();
+                let gap = s.host.clock.timegap;
+                s.host.clock.timegap = 0.0;
+                s.vm.run_frame(&p, &mut s.state, &mut s.host);
+                s.host.clock.timegap = gap;
+            }
+        }
+        self.update_control_cables();
+    }
+
+    /// Propagate `[control_cable_front]` and `[control_cable_back]` train-wire signals
+    /// across the leading vehicle and all coupled parts.
+    pub(crate) fn update_control_cables(&mut self) {
+        if self.ty.def.control_cable_front.is_empty()
+            && self.ty.def.control_cable_back.is_empty()
+            && self.trailers.iter().all(|t| {
+                t.ty.def.control_cable_front.is_empty()
+                    && t.ty.def.control_cable_back.is_empty()
+            })
+        {
+            return;
+        }
+        let norm_plug = |plug: &str, is_back: bool, reversed: bool| -> &'static str {
+            let swap = is_back ^ reversed;
+            if plug.eq_ignore_ascii_case("L") {
+                if swap { "r" } else { "l" }
+            } else if plug.eq_ignore_ascii_case("R") {
+                if swap { "l" } else { "r" }
+            } else {
+                "c"
+            }
+        };
+        let mut bus: HashMap<(&'static str, i32), f32> = HashMap::new();
+        let mut record_writes = |cables: &[omsi_vehicle::vehicle::ControlCable],
+                                 is_back: bool,
+                                 reversed: bool,
+                                 read_var: &dyn Fn(&str) -> Option<f32>| {
+            for cc in cables {
+                let [plug, num, _rvar, wvar, cvar] = cc.lines.as_slice() else {
+                    continue;
+                };
+                if read_var(cvar.trim()).unwrap_or(0.0) <= 0.5 {
+                    continue;
+                }
+                let Ok(idx) = num.trim().parse::<i32>() else {
+                    continue;
+                };
+                let key = (norm_plug(plug.trim(), is_back, reversed), idx);
+                let val = read_var(wvar.trim()).unwrap_or(0.0);
+                let entry = bus.entry(key).or_insert(0.0);
+                if val.abs() > entry.abs() || (val.abs() == entry.abs() && val > *entry) {
+                    *entry = val;
+                }
+            }
+        };
+        record_writes(&self.ty.def.control_cable_front, false, false, &|n| self.var(n));
+        record_writes(&self.ty.def.control_cable_back, true, false, &|n| self.var(n));
+        for t in &self.trailers {
+            record_writes(&t.ty.def.control_cable_front, false, t.reversed, &|n| {
+                t.var(n).or_else(|| self.var(n))
+            });
+            record_writes(&t.ty.def.control_cable_back, true, t.reversed, &|n| {
+                t.var(n).or_else(|| self.var(n))
+            });
+        }
+        if bus.is_empty() {
+            return;
+        }
+        for (is_back, cables) in [
+            (false, self.ty.def.control_cable_front.clone()),
+            (true, self.ty.def.control_cable_back.clone()),
+        ] {
+            for cc in &cables {
+                let [plug, num, rvar, _wvar, cvar] = cc.lines.as_slice() else {
+                    continue;
+                };
+                if self.var(cvar.trim()).unwrap_or(0.0) <= 0.5 {
+                    continue;
+                }
+                let Ok(idx) = num.trim().parse::<i32>() else {
+                    continue;
+                };
+                let key = (norm_plug(plug.trim(), is_back, false), idx);
+                if let Some(&val) = bus.get(&key) {
+                    self.set_var(rvar.trim(), val);
+                }
+            }
+        }
+        for t in &mut self.trailers {
+            if t.script.is_none() {
+                continue;
+            }
+            for (is_back, cables) in [
+                (false, t.ty.def.control_cable_front.clone()),
+                (true, t.ty.def.control_cable_back.clone()),
+            ] {
+                for cc in &cables {
+                    let [plug, num, rvar, _wvar, cvar] = cc.lines.as_slice() else {
+                        continue;
+                    };
+                    if t.var(cvar.trim()).unwrap_or(0.0) <= 0.5 {
+                        continue;
+                    }
+                    let Ok(idx) = num.trim().parse::<i32>() else {
+                        continue;
+                    };
+                    let key = (norm_plug(plug.trim(), is_back, t.reversed), idx);
+                    if let Some(&val) = bus.get(&key) {
+                        t.set_var(rvar.trim(), val);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Run one frame of the scripts of coupled parts that have their own [`PartScript`].
+    pub(super) fn update_part_scripts(&mut self, _dt: f32, ai: Option<&AiFrame>) {
+        if !self.trailers.iter().any(|t| t.script.is_some()) {
+            return;
+        }
+        let n_trailers = self.trailers.len();
+        let v_vel = self.get(self.v_velocity);
+        let v_vel_gnd = self.get(self.v_velocity_ground);
+        let controls = self.physics.controls;
+        let env_bright = self.var("Envir_Brightness").unwrap_or(1.0);
+        let dirt = self.dirt;
+        let scheme = self.host.paint_scheme.flatten();
+        for i in 0..n_trailers {
+            let t = &mut self.trailers[i];
+            if t.script.is_none() {
+                continue;
+            }
+            if let Some(idx) = scheme {
+                if let Some(ps) = t.ty.paint_schemes.get(idx) {
+                    let vars = ps.set_vars.clone();
+                    for (var, val) in vars {
+                        t.set_var(&var, val);
+                    }
+                }
+            }
+            t.set_var("Envir_Brightness", env_bright);
+            t.set_var("Dirt_Norm", dirt);
+            t.set_var("Schedule_Active", self.host.schedule_active);
+            t.set_var("train_frontcoupling", 1.0);
+            t.set_var("train_backcoupling", if i + 1 < n_trailers { 1.0 } else { 0.0 });
+            t.set_var("train_me_reverse", if t.reversed { 1.0 } else { 0.0 });
+            if let Some(ai) = ai {
+                let station = match ai.at_station {
+                    1 => 1.0,
+                    -1 => -1.0,
+                    _ => 0.0,
+                };
+                t.set_var("AI", 1.0);
+                t.set_var("AI_Blinker_L", matches!(ai.blinker, 1 | 3) as i32 as f32);
+                t.set_var("AI_Blinker_R", matches!(ai.blinker, 2 | 3) as i32 as f32);
+                t.set_var("AI_Brakelight", ai.brake as i32 as f32);
+                t.set_var("AI_Light", ai.lights as i32 as f32);
+                t.set_var("AI_Interiorlight", ai.lights as i32 as f32);
+                t.set_var("AI_Engine", if ai.engine_off { -1.0 } else { 1.0 });
+                t.set_var("AI_Scheduled_AtStation", station);
+                t.set_var("AI_Scheduled_AtStation_Side", ai.at_station_side);
+            }
+            let rot = t.body_rotation();
+            let pos = t.position;
+            let reversed = t.reversed;
+            let p = t.ty.program.clone();
+            let s = t.script.as_mut().unwrap();
+            s.host.clock = self.host.clock.clone();
+            s.host.precip_type = self.host.precip_type;
+            s.host.precip_rate = self.host.precip_rate;
+            s.host.street_cond = self.host.street_cond;
+            s.host.temperature = self.host.temperature;
+            s.host.abs_humidity = self.host.abs_humidity;
+            s.host.sun_alt = self.host.sun_alt;
+            if s.host.hof.is_none() && self.host.hof.is_some() {
+                s.host.hof = self.host.hof.clone();
+            }
+            if self.ground.is_some() || self.contact.is_some() {
+                let g = self.ground.clone();
+                let contact = self.contact.clone();
+                s.host.ground_probe = Some(std::sync::Arc::new(move |x, y, z| {
+                    let w = pos + rot.transform_point3(glam::Vec3::new(x, y, z)).as_dvec3();
+                    let h = match &contact {
+                        Some(c) => c.probe(w.x, w.y, w.z + 0.5).below,
+                        None => g.as_ref().and_then(|g| g(w.x, w.y)),
+                    };
+                    h.map_or(0.0, |h| (w.z - h) as f32)
+                }));
+            }
+            let sign = if reversed { -1.0 } else { 1.0 };
+            if let Some(id) = s.v_velocity {
+                s.state.vars[id as usize] = v_vel * sign;
+            }
+            if let Some(id) = s.v_velocity_ground {
+                s.state.vars[id as usize] = v_vel_gnd * sign;
+            }
+            if let Some(id) = s.v_throttle {
+                s.state.vars[id as usize] = controls.throttle;
+            }
+            if let Some(id) = s.v_brake {
+                s.state.vars[id as usize] = controls.brake;
+            }
+            if let Some(id) = s.v_clutch {
+                s.state.vars[id as usize] = controls.clutch;
+            }
+            if ai.is_some() && !p.frame_ai.is_empty() {
+                s.vm.run_frame_ai(&p, &mut s.state, &mut s.host);
+            } else {
+                s.vm.run_frame(&p, &mut s.state, &mut s.host);
+            }
+            self.host.fired_triggers.append(&mut s.host.fired_triggers);
+            self.host.fired_file_triggers.append(&mut s.host.fired_file_triggers);
+        }
     }
 
     /// Let the scripts measure the ground under a point of the vehicle
@@ -394,11 +615,15 @@ impl VehicleInstance {
         self.run_collision_trigger();
         let p = self.ty.program.clone();
         crate::timetable_run::apply_pending_destination(self);
+        self.update_control_cables();
         if p.frame_ai.is_empty() {
             self.vm.run_frame(&p, &mut self.state, &mut self.host);
         } else {
             self.vm.run_frame_ai(&p, &mut self.state, &mut self.host);
         }
+        self.update_control_cables();
+        self.update_part_scripts(dt, Some(ai));
+        self.update_control_cables();
         self.clear_pax_requests();
         for &(id, v) in pinned {
             self.put(Some(id), v);

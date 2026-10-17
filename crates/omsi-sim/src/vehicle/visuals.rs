@@ -166,21 +166,29 @@ impl VehicleInstance {
         // the lamps come on and go out with their `timeconst`
         let mut lf = std::mem::take(&mut self.light_fade);
         let mut part_fades: Vec<Vec<f32>> = self.trailers.iter_mut().map(|t| std::mem::take(&mut t.light_fade)).collect();
-        // (the vehicle's own lights and the coupled parts' - which read this vehicle's
-        // variables too - by their plans' sources, resolved against this vehicle's variables
-        // as the names were: each part's lamp was a look-up by name every frame)
+        // (the vehicle's own lights and the coupled parts' by their plans' sources, resolved
+        // against the part's own variables when it has scripts or this vehicle's otherwise)
         for t in &mut self.trailers {
-            t.props_plan.refresh(&t.ty, &self.var_index);
+            let var_index = t.script.as_ref().map_or(&self.var_index, |s| &s.var_index);
+            t.props_plan.refresh(&t.ty, var_index);
         }
-        let value = |n: &str| -> f32 { n.trim().parse::<f32>().ok().or_else(|| self.var(n.trim())).unwrap_or(0.0) };
-        let vars = &self.state.vars;
-        let fade = |model: &omsi_model::Model, fades: &mut Vec<f32>, lights: &[PropSource]| {
+        let fade = |model: &omsi_model::Model,
+                    fades: &mut Vec<f32>,
+                    lights: &[PropSource],
+                    vars: &[f32],
+                    lookup: &dyn Fn(&str) -> Option<f32>| {
             let mut k = 0;
             for md in &model.meshes {
                 for l in &md.light_enh_2 {
                     let v = match lights.get(k) {
                         Some(src) => src.value(vars, 0.0),
-                        None => value(&l.variable),
+                        None => l
+                            .variable
+                            .trim()
+                            .parse::<f32>()
+                            .ok()
+                            .or_else(|| lookup(l.variable.trim()))
+                            .unwrap_or(0.0),
                     };
                     let target = (v * if l.factor > 0.0 { l.factor } else { 1.0 }).clamp(0.0, 2.0);
                     // (a NaN stays NaN through clamp: the lamp's glow was drawn black on Windows)
@@ -202,9 +210,12 @@ impl VehicleInstance {
                 }
             }
         };
-        fade(&self.ty.model, &mut lf, &self.props_plan.lights);
+        fade(&self.ty.model, &mut lf, &self.props_plan.lights, &self.state.vars, &|n| self.var(n));
         for (t, f) in self.trailers.iter().zip(part_fades.iter_mut()) {
-            fade(&t.ty.model, f, &t.props_plan.lights);
+            let vars = t.script.as_ref().map_or(&self.state.vars, |s| &s.state.vars);
+            fade(&t.ty.model, f, &t.props_plan.lights, vars, &|n| {
+                t.var(n).or_else(|| self.var(n))
+            });
         }
         self.light_fade = lf;
         for (t, f) in self.trailers.iter_mut().zip(part_fades) {
@@ -221,7 +232,8 @@ impl VehicleInstance {
                 let value = |n: &str| self.var(n).unwrap_or(0.0);
                 ps.update_over(dt, self.position, self.body_rotation(), &|| self.particle_ground(), &value);
                 for (t, set) in self.trailers.iter().zip(parts.iter_mut()) {
-                    set.update_over(dt, t.position, t.body_rotation(), &|| [-t.ground_lift(), 0.0, 0.0], &value);
+                    let part_value = |n: &str| t.var(n).or_else(|| self.var(n)).unwrap_or(0.0);
+                    set.update_over(dt, t.position, t.body_rotation(), &|| [-t.ground_lift(), 0.0, 0.0], &part_value);
                 }
             }
             self.particles = ps;

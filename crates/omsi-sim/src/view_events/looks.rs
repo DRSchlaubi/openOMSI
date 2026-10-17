@@ -178,7 +178,7 @@ impl crate::ai_traffic::TrafficSim {
             // its coupled parts: their interior lamps by its variables, their text textures
             let mut trailers = std::mem::take(&mut v.trailers);
             for (k, part) in trailers.iter_mut().enumerate() {
-                lamps.push(lamps_on(&part.ty, |n| v.var(n), &mut out.lamps));
+                lamps.push(lamps_on(&part.ty, |n| part.var(n).or_else(|| v.var(n)), &mut out.lamps));
                 for i in part.update_text_textures(v) {
                     let tt = &mut part.text_textures[i];
                     if let Some(img) = tt.pending.take() {

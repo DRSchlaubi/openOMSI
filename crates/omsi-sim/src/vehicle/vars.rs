@@ -129,7 +129,37 @@ impl VehicleInstance {
                 &mut self.host,
             );
         }
+        if !fired {
+            for i in 0..self.trailers.len() {
+                if self.trailers[i].script.is_some()
+                    && self.trailers[i].ty.program.trigger(name).is_some()
+                {
+                    fired |= self.trigger_trailer(i, name);
+                }
+            }
+        }
         fired
+    }
+
+    /// Fire a trigger on coupled part `index` when it has its own script state, falling
+    /// back to the leading vehicle when the part shares scripts or does not define it.
+    pub fn trigger_trailer(&mut self, index: usize, name: &str) -> bool {
+        if let Some(t) = self.trailers.get_mut(index) {
+            if let Some(s) = &mut t.script {
+                let p = t.ty.program.clone();
+                if p.trigger(name).is_some() {
+                    s.host.mouse = self.host.mouse;
+                    s.host.clock = self.host.clock.clone();
+                    let fired = s.vm.run_trigger(&p, name, &mut s.state, &mut s.host);
+                    self.host.fired_triggers.append(&mut s.host.fired_triggers);
+                    self.host
+                        .fired_file_triggers
+                        .append(&mut s.host.fired_file_triggers);
+                    return fired;
+                }
+            }
+        }
+        self.trigger(name)
     }
 
     /// The script variables as `names` would leave them, run one after another, with the
